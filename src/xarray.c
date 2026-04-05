@@ -622,7 +622,11 @@ void *xas_store(struct xa_state *xas, void *entry)
         if (off != canonical &&
             (!xa_is_sibling(slot) || xa_to_sibling(slot) != canonical))
             break;
-        xa_clear_marks_at(xas, node, off);
+        /* Preserve marks on the canonical slot during overwrite;
+         * only clear marks when erasing (entry == NULL) or on
+         * sibling slots being removed. */
+        if (off != canonical || entry == NULL)
+            xa_clear_marks_at(xas, node, off);
         xa_slot_store(&node->slots[off], NULL);
         node->count--;
     }
@@ -899,6 +903,10 @@ void *xa_store(struct xarray *xa, uint64_t index, void *entry, uint64_t gfp)
     void *old;
     XA_STATE(xas, xa, index);
     (void)gfp;
+
+    /* Reject internal/sentinel entries — they would corrupt the tree. */
+    if (xa_is_internal(entry))
+        return XA_ZERO_ENTRY;
 
     xa_lock(xa);
     old = xas_store(&xas, entry);

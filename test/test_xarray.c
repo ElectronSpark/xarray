@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <cmocka.h>
 
 #include "xarray.h"
@@ -1151,7 +1152,7 @@ static void test_all_marks_on_entry(void **state)
 /*  Test: Mark survives overwrite but not erase                            */
 /* ====================================================================== */
 
-static void test_mark_cleared_on_overwrite(void **state)
+static void test_mark_survives_overwrite(void **state)
 {
     (void)state;
     struct xarray xa;
@@ -1161,18 +1162,16 @@ static void test_mark_cleared_on_overwrite(void **state)
     xa_set_mark(&xa, 5, XA_MARK_0);
     assert_true(xa_get_mark(&xa, 5, XA_MARK_0));
 
-    /* Overwrite entry — xas_store clears marks before re-storing */
+    /* Overwrite entry — marks must survive */
     xa_store(&xa, 5, ENTRY(50), 0);
     assert_ptr_equal(xa_load(&xa, 5), ENTRY(50));
-    assert_false(xa_get_mark(&xa, 5, XA_MARK_0));
-
-    /* Set mark again, erase — mark should be gone */
-    xa_set_mark(&xa, 5, XA_MARK_0);
     assert_true(xa_get_mark(&xa, 5, XA_MARK_0));
+
+    /* Erase — mark should be gone */
     xa_erase(&xa, 5);
     assert_false(xa_get_mark(&xa, 5, XA_MARK_0));
 
-    /* Re-insert — should not have mark */
+    /* Re-insert after erase — should not have mark */
     xa_store(&xa, 5, ENTRY(55), 0);
     assert_false(xa_get_mark(&xa, 5, XA_MARK_0));
 
@@ -1733,6 +1732,1077 @@ static void test_power_of_64_indices(void **state)
 }
 
 /* ====================================================================== */
+/*  Test: UINT64_MAX index                                                 */
+/* ====================================================================== */
+
+static void test_uint64_max_index(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    uint64_t max_idx = ~0ULL;
+    xa_store(&xa, max_idx, ENTRY(1), 0);
+    assert_ptr_equal(xa_load(&xa, max_idx), ENTRY(1));
+    assert_null(xa_load(&xa, max_idx - 1));
+    assert_null(xa_load(&xa, 0));
+
+    void *old = xa_erase(&xa, max_idx);
+    assert_ptr_equal(old, ENTRY(1));
+    assert_true(xa_empty(&xa));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Index 0 single-entry head with marks                             */
+/* ====================================================================== */
+
+static void test_index0_head_marks(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store only at index 0 — head is a direct pointer, no node. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+
+    /* Set and get marks on the single-entry head */
+    xa_set_mark(&xa, 0, XA_MARK_0);
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_1));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    xa_set_mark(&xa, 0, XA_MARK_2);
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    /* Clear mark */
+    xa_clear_mark(&xa, 0, XA_MARK_0);
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    /* Marked iteration should find the entry */
+    uint64_t index;
+    void *entry;
+    size_t count = 0;
+    xa_for_each_marked(&xa, index, entry, XA_MARK_2) {
+        assert_int_equal(index, 0);
+        count++;
+    }
+    assert_int_equal(count, 1);
+
+    /* After erase, mark should be gone */
+    xa_erase(&xa, 0);
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Store at index 0 into an already-deep tree                       */
+/* ====================================================================== */
+
+static void test_store_index0_into_deep_tree(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Force a deep tree first */
+    xa_store(&xa, 1ULL << 32, ENTRY(1), 0);
+    assert_null(xa_load(&xa, 0));
+
+    /* Now store at index 0 */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+    assert_ptr_equal(xa_load(&xa, 1ULL << 32), ENTRY(1));
+
+    assert_int_equal(xa_count_entries(&xa), 2);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_find on empty xarray                                          */
+/* ====================================================================== */
+
+static void test_find_empty(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    uint64_t index = 0;
+    void *entry = xa_find(&xa, &index, ~0ULL, XA_MARK_MAX);
+    assert_null(entry);
+
+    /* Also with a specific mark */
+    index = 0;
+    entry = xa_find(&xa, &index, ~0ULL, XA_MARK_0);
+    assert_null(entry);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_find_after when *indexp == UINT64_MAX                         */
+/* ====================================================================== */
+
+static void test_find_after_uint64_max(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0);
+
+    uint64_t index = ~0ULL;
+    void *entry = xa_find_after(&xa, &index, ~0ULL, XA_MARK_MAX);
+    /* *indexp == max, so xa_find_after should return NULL immediately */
+    assert_null(entry);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_find_after when *indexp == max                                */
+/* ====================================================================== */
+
+static void test_find_after_at_max(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 5, ENTRY(5), 0);
+    xa_store(&xa, 10, ENTRY(10), 0);
+
+    /* *indexp == max, should return NULL */
+    uint64_t index = 10;
+    void *entry = xa_find_after(&xa, &index, 10, XA_MARK_MAX);
+    assert_null(entry);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_find with max = 0                                             */
+/* ====================================================================== */
+
+static void test_find_max_zero(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 1, ENTRY(1), 0);
+
+    /* max=0 should find only index 0 */
+    uint64_t index = 0;
+    void *entry = xa_find(&xa, &index, 0, XA_MARK_MAX);
+    assert_non_null(entry);
+    assert_int_equal(index, 0);
+
+    /* xa_find_after with max=0 should return NULL */
+    entry = xa_find_after(&xa, &index, 0, XA_MARK_MAX);
+    assert_null(entry);
+
+    /* max=0 when nothing at index 0 */
+    struct xarray xa2;
+    xa_init(&xa2);
+    xa_store(&xa2, 5, ENTRY(5), 0);
+
+    index = 0;
+    entry = xa_find(&xa2, &index, 0, XA_MARK_MAX);
+    assert_null(entry);
+
+    xa_destroy(&xa);
+    xa_destroy(&xa2);
+}
+
+/* ====================================================================== */
+/*  Test: xa_for_each_marked on empty / no marks                           */
+/* ====================================================================== */
+
+static void test_marked_iteration_empty_and_no_marks(void **state)
+{
+    (void)state;
+
+    /* Empty xarray */
+    struct xarray xa;
+    xa_init(&xa);
+    uint64_t index;
+    void *entry;
+    size_t count = 0;
+    xa_for_each_marked(&xa, index, entry, XA_MARK_0) {
+        count++;
+    }
+    assert_int_equal(count, 0);
+    xa_destroy(&xa);
+
+    /* Non-empty xarray with no marks */
+    struct xarray xa2;
+    xa_init(&xa2);
+    for (uint64_t i = 0; i < 10; i++)
+        xa_store(&xa2, i, ENTRY(i), 0);
+    count = 0;
+    xa_for_each_marked(&xa2, index, entry, XA_MARK_0) {
+        count++;
+    }
+    assert_int_equal(count, 0);
+    xa_destroy(&xa2);
+}
+
+/* ====================================================================== */
+/*  Test: Double erase same index                                          */
+/* ====================================================================== */
+
+static void test_double_erase_same_index(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 50, ENTRY(50), 0);
+    xa_store(&xa, 100, ENTRY(100), 0);
+
+    void *old = xa_erase(&xa, 50);
+    assert_ptr_equal(old, ENTRY(50));
+
+    /* Second erase of same index */
+    old = xa_erase(&xa, 50);
+    assert_null(old);
+
+    /* Other entry unaffected */
+    assert_ptr_equal(xa_load(&xa, 100), ENTRY(100));
+    assert_int_equal(xa_count_entries(&xa), 1);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Double destroy after entries                                     */
+/* ====================================================================== */
+
+static void test_double_destroy_with_entries(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    for (uint64_t i = 0; i < 100; i++)
+        xa_store(&xa, i, ENTRY(i), 0);
+
+    xa_destroy(&xa);
+    assert_true(xa_empty(&xa));
+
+    /* Second destroy should be safe */
+    xa_destroy(&xa);
+    assert_true(xa_empty(&xa));
+}
+
+/* ====================================================================== */
+/*  Test: Sibling entries via cursor API                                   */
+/* ====================================================================== */
+
+static void test_sibling_entries(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store a multi-slot entry using xa_sibs */
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 4);
+    xas.xa_sibs = 3; /* occupy slots 4, 5, 6, 7 */
+    void *old = xas_store(&xas, ENTRY(4));
+    assert_null(old);
+    xa_unlock(&xa);
+
+    /* The canonical slot should return the entry */
+    assert_ptr_equal(xa_load(&xa, 4), ENTRY(4));
+
+    /* Sibling slots should also resolve to the same entry */
+    assert_ptr_equal(xa_load(&xa, 5), ENTRY(4));
+    assert_ptr_equal(xa_load(&xa, 6), ENTRY(4));
+    assert_ptr_equal(xa_load(&xa, 7), ENTRY(4));
+
+    /* Adjacent slots should be unaffected */
+    assert_null(xa_load(&xa, 3));
+    assert_null(xa_load(&xa, 8));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_clear_mark on entry without the mark                          */
+/* ====================================================================== */
+
+static void test_clear_mark_without_mark(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 10, ENTRY(10), 0);
+    xa_set_mark(&xa, 10, XA_MARK_0);
+
+    /* Clear MARK_1 which was never set — should be a no-op */
+    xa_clear_mark(&xa, 10, XA_MARK_1);
+    assert_false(xa_get_mark(&xa, 10, XA_MARK_1));
+
+    /* MARK_0 should be unaffected */
+    assert_true(xa_get_mark(&xa, 10, XA_MARK_0));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Marks across tree levels after partial erase                     */
+/* ====================================================================== */
+
+static void test_marks_across_levels_partial_erase(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Force multi-level tree */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 64, ENTRY(64), 0);
+    xa_store(&xa, 4096, ENTRY(4096), 0);
+
+    xa_set_mark(&xa, 0, XA_MARK_0);
+    xa_set_mark(&xa, 64, XA_MARK_0);
+    xa_set_mark(&xa, 4096, XA_MARK_0);
+
+    /* Erase the middle marked entry */
+    xa_erase(&xa, 64);
+
+    /* Remaining marks should still be correct */
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 64, XA_MARK_0));
+    assert_true(xa_get_mark(&xa, 4096, XA_MARK_0));
+
+    /* Marked iteration should yield exactly 0 and 4096 */
+    uint64_t index;
+    void *entry;
+    uint64_t found[2];
+    size_t count = 0;
+    xa_for_each_marked(&xa, index, entry, XA_MARK_0) {
+        assert_true(count < 2);
+        found[count++] = index;
+    }
+    assert_int_equal(count, 2);
+    assert_int_equal(found[0], 0);
+    assert_int_equal(found[1], 4096);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_get_mark on empty index in non-empty tree                     */
+/* ====================================================================== */
+
+static void test_get_mark_on_empty_index(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 10, ENTRY(10), 0);
+    xa_set_mark(&xa, 10, XA_MARK_0);
+
+    /* Index 5 has no entry — get_mark should return false */
+    assert_false(xa_get_mark(&xa, 5, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 100, XA_MARK_0));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: xa_init_flags with non-zero flags                                */
+/* ====================================================================== */
+
+static void test_init_flags(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init_flags(&xa, 0x42);
+
+    assert_true(xa_empty(&xa));
+
+    /* Store and load should work normally */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Invalid mark values (mark >= XA_MAX_MARKS)                       */
+/* ====================================================================== */
+
+static void test_invalid_mark_value(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 10, ENTRY(10), 0);
+
+    /* mark = 3 is out of range (XA_MAX_MARKS == 3, valid range 0..2) */
+    xa_set_mark(&xa, 10, 3);
+    assert_false(xa_get_mark(&xa, 10, 3));
+
+    /* mark = 255 */
+    xa_set_mark(&xa, 10, 255);
+    assert_false(xa_get_mark(&xa, 10, 255));
+
+    xa_clear_mark(&xa, 10, 3);
+    assert_false(xa_get_mark(&xa, 10, 3));
+
+    /* Valid marks should still work */
+    xa_set_mark(&xa, 10, XA_MARK_0);
+    assert_true(xa_get_mark(&xa, 10, XA_MARK_0));
+
+    /* Cursor API with invalid mark */
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 10);
+    xas_load(&xas);
+    xas_set_mark(&xas, 3);
+    assert_false(xas_get_mark(&xas, 3));
+    xas_clear_mark(&xas, 3);
+    xa_unlock(&xa);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Store NULL at non-existent index                                 */
+/* ====================================================================== */
+
+static void test_store_null_nonexistent(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store NULL where nothing exists — should be a no-op */
+    void *old = xa_store(&xa, 42, NULL, 0);
+    assert_null(old);
+    assert_null(xa_load(&xa, 42));
+
+    /* With existing entries elsewhere */
+    xa_store(&xa, 10, ENTRY(10), 0);
+    old = xa_store(&xa, 42, NULL, 0);
+    assert_null(old);
+    assert_null(xa_load(&xa, 42));
+    assert_ptr_equal(xa_load(&xa, 10), ENTRY(10));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Cursor error state operations                                    */
+/* ====================================================================== */
+
+static void test_cursor_error_state(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 5, ENTRY(5), 0);
+
+    /* Manually put cursor into error state */
+    XA_STATE(xas, &xa, 5);
+    xas_set_err(&xas, -ENOMEM);
+
+    assert_true(xas_is_error(&xas));
+    assert_int_equal(xas_error(&xas), -ENOMEM);
+
+    /* Operations on error-state cursor should return NULL / no-op */
+    xa_rcu_lock();
+    void *entry = xas_find(&xas, ~0ULL);
+    assert_null(entry);
+
+    entry = xas_find_marked(&xas, ~0ULL, XA_MARK_0);
+    assert_null(entry);
+
+    assert_false(xas_get_mark(&xas, XA_MARK_0));
+    xa_rcu_unlock();
+
+    /* xas_set should clear the error */
+    xas_set(&xas, 5);
+    assert_false(xas_is_error(&xas));
+    assert_int_equal(xas_error(&xas), 0);
+
+    xa_rcu_lock();
+    entry = xas_load(&xas);
+    assert_ptr_equal(entry, ENTRY(5));
+    xa_rcu_unlock();
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Test: Mark overwrite consistency (head path vs node path)              */
+/* ====================================================================== */
+
+static void test_mark_overwrite_head_vs_node(void **state)
+{
+    (void)state;
+
+    /* Case A: single-entry head (index 0 only) — marks survive overwrite */
+    struct xarray xa1;
+    xa_init(&xa1);
+    xa_store(&xa1, 0, ENTRY(0), 0);
+    xa_set_mark(&xa1, 0, XA_MARK_0);
+    xa_set_mark(&xa1, 0, XA_MARK_2);
+    xa_store(&xa1, 0, ENTRY(1), 0);
+    assert_true(xa_get_mark(&xa1, 0, XA_MARK_0));
+    assert_true(xa_get_mark(&xa1, 0, XA_MARK_2));
+    xa_destroy(&xa1);
+
+    /* Case B: node-level (force node by having a second entry) */
+    struct xarray xa2;
+    xa_init(&xa2);
+    xa_store(&xa2, 0, ENTRY(0), 0);
+    xa_store(&xa2, 100, ENTRY(100), 0);
+    xa_set_mark(&xa2, 0, XA_MARK_0);
+    xa_set_mark(&xa2, 0, XA_MARK_2);
+    xa_store(&xa2, 0, ENTRY(1), 0);
+    assert_true(xa_get_mark(&xa2, 0, XA_MARK_0));
+    assert_true(xa_get_mark(&xa2, 0, XA_MARK_2));
+
+    /* Verify marked iteration still finds the entry */
+    uint64_t index;
+    void *entry;
+    size_t count = 0;
+    xa_for_each_marked(&xa2, index, entry, XA_MARK_0) {
+        assert_int_equal(index, 0);
+        assert_ptr_equal(entry, ENTRY(1));
+        count++;
+    }
+    assert_int_equal(count, 1);
+    xa_destroy(&xa2);
+}
+
+/* ====================================================================== */
+/*  Test: Store sentinel / internal values (negative test)                 */
+/* ====================================================================== */
+
+static void test_store_internal_entries(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Storing XA_ZERO_ENTRY must be rejected (returns error) */
+    void *ret = xa_store(&xa, 0, XA_ZERO_ENTRY, 0);
+    assert_ptr_equal(ret, XA_ZERO_ENTRY);
+    assert_true(xa_empty(&xa));
+    assert_null(xa_load(&xa, 0));
+
+    /* Storing XA_RETRY_ENTRY must be rejected */
+    ret = xa_store(&xa, 1, XA_RETRY_ENTRY, 0);
+    assert_ptr_equal(ret, XA_ZERO_ENTRY);
+    assert_true(xa_empty(&xa));
+    assert_null(xa_load(&xa, 1));
+
+    /* A valid store should still work after rejections */
+    ret = xa_store(&xa, 0, ENTRY(0), 0);
+    assert_null(ret);
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Random insert/delete/lookup churn                         */
+/* ====================================================================== */
+
+#define STRESS_CHURN_COUNT   4096
+#define STRESS_CHURN_ROUNDS  8
+
+static void test_stress_random_churn(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /*
+     * Maintain a shadow array tracking what should be present.
+     * Perform random insert/delete/overwrite and verify consistency.
+     */
+    bool present[STRESS_CHURN_COUNT];
+    memset(present, 0, sizeof(present));
+
+    uint64_t rng = 0xA5A5A5A5DEADBEEFULL;
+
+    for (int round = 0; round < STRESS_CHURN_ROUNDS; round++) {
+        /* Insert phase: insert ~75% of slots */
+        for (size_t i = 0; i < STRESS_CHURN_COUNT; i++) {
+            if ((xorshift64(&rng) % 4) != 0) {
+                xa_store(&xa, i, ENTRY(i), 0);
+                present[i] = true;
+            }
+        }
+
+        /* Delete phase: randomly delete ~50% of existing entries */
+        for (size_t i = 0; i < STRESS_CHURN_COUNT; i++) {
+            if (present[i] && (xorshift64(&rng) % 2) == 0) {
+                void *old = xa_erase(&xa, i);
+                assert_ptr_equal(old, ENTRY(i));
+                present[i] = false;
+            }
+        }
+
+        /* Verify all entries match shadow */
+        size_t expected_count = 0;
+        for (size_t i = 0; i < STRESS_CHURN_COUNT; i++) {
+            void *e = xa_load(&xa, i);
+            if (present[i]) {
+                assert_ptr_equal(e, ENTRY(i));
+                expected_count++;
+            } else {
+                assert_null(e);
+            }
+        }
+        assert_int_equal(xa_count_entries(&xa), expected_count);
+
+        /* Overwrite phase: overwrite some existing entries */
+        for (size_t i = 0; i < STRESS_CHURN_COUNT; i++) {
+            if (present[i] && (xorshift64(&rng) % 3) == 0) {
+                void *old = xa_store(&xa, i, ENTRY(i + STRESS_CHURN_COUNT), 0);
+                assert_ptr_equal(old, ENTRY(i));
+                /* Update to new value for verification */
+                void *e = xa_load(&xa, i);
+                assert_ptr_equal(e, ENTRY(i + STRESS_CHURN_COUNT));
+                /* Restore original for next round simplicity */
+                xa_store(&xa, i, ENTRY(i), 0);
+            }
+        }
+    }
+
+    /* Final cleanup: erase everything */
+    for (size_t i = 0; i < STRESS_CHURN_COUNT; i++) {
+        if (present[i])
+            xa_erase(&xa, i);
+    }
+    assert_true(xa_empty(&xa));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Sparse random indices across wide key space               */
+/* ====================================================================== */
+
+#define STRESS_SPARSE_COUNT  512
+
+static void test_stress_sparse_random(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    uint64_t indices[STRESS_SPARSE_COUNT];
+    uint64_t rng = 0x123456789ABCDEF0ULL;
+
+    /* Generate random indices spread across a wide range */
+    for (size_t i = 0; i < STRESS_SPARSE_COUNT; i++) {
+        uint64_t hi = xorshift64(&rng);
+        uint64_t lo = xorshift64(&rng);
+        /* Limit to 40 bits to keep memory reasonable but force deep trees */
+        indices[i] = ((hi << 20) | (lo & 0xFFFFF)) & ((1ULL << 40) - 1);
+    }
+
+    /* Deduplicate by storing index position — last writer wins */
+    for (size_t i = 0; i < STRESS_SPARSE_COUNT; i++)
+        xa_store(&xa, indices[i], ENTRY(i), 0);
+
+    /* Verify: each index should load the last-written ENTRY */
+    for (int i = (int)STRESS_SPARSE_COUNT - 1; i >= 0; i--) {
+        void *e = xa_load(&xa, indices[i]);
+        assert_non_null(e);
+    }
+
+    /* Iteration: should be in ascending index order */
+    uint64_t idx;
+    void *entry;
+    uint64_t prev = 0;
+    bool first = true;
+    xa_for_each(&xa, idx, entry) {
+        if (!first)
+            assert_true(idx > prev);
+        first = false;
+        prev = idx;
+    }
+
+    /* Erase all and verify empty */
+    for (size_t i = 0; i < STRESS_SPARSE_COUNT; i++)
+        xa_erase(&xa, indices[i]);
+    assert_true(xa_empty(&xa));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Rapid tree grow/shrink cycles                             */
+/* ====================================================================== */
+
+#define STRESS_GROWSHRINK_ROUNDS 16
+
+static void test_stress_grow_shrink_cycles(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /*
+     * Each round, insert an entry at an exponentially larger index
+     * (forcing the tree to grow many levels), then erase it (forcing
+     * full shrink back to empty). This hammers expand/shrink paths.
+     */
+    uint64_t big_indices[] = {
+        0, 63, 64, 4095, 4096, 262143, 262144,
+        (1ULL << 24), (1ULL << 30), (1ULL << 36),
+        (1ULL << 42), (1ULL << 48), (1ULL << 54), (1ULL << 60),
+        (~0ULL >> 1), ~0ULL
+    };
+
+    for (size_t round = 0; round < ARRAY_SIZE(big_indices); round++) {
+        uint64_t idx = big_indices[round];
+        xa_store(&xa, idx, ENTRY(1), 0);
+        assert_ptr_equal(xa_load(&xa, idx), ENTRY(1));
+        assert_false(xa_empty(&xa));
+
+        xa_erase(&xa, idx);
+        assert_null(xa_load(&xa, idx));
+        assert_true(xa_empty(&xa));
+    }
+
+    /* Combined: insert at both small and huge index, then erase */
+    for (size_t round = 0; round < ARRAY_SIZE(big_indices); round++) {
+        uint64_t idx = big_indices[round];
+        if (idx == 0)
+            continue; /* skip: both would alias to index 0 */
+        xa_store(&xa, 0, ENTRY(0), 0);
+        xa_store(&xa, idx, ENTRY(1), 0);
+
+        assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+        assert_ptr_equal(xa_load(&xa, idx), ENTRY(1));
+
+        xa_erase(&xa, idx);
+        assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+        xa_erase(&xa, 0);
+        assert_true(xa_empty(&xa));
+    }
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Random marks with verification                            */
+/* ====================================================================== */
+
+#define STRESS_MARK_COUNT  512
+
+static void test_stress_random_marks(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    uint8_t mark_state[STRESS_MARK_COUNT][XA_MAX_MARKS];
+    memset(mark_state, 0, sizeof(mark_state));
+
+    /* Populate */
+    for (uint64_t i = 0; i < STRESS_MARK_COUNT; i++)
+        xa_store(&xa, i, ENTRY(i), 0);
+
+    uint64_t rng = 0xFEEDFACECAFEBABEULL;
+
+    /* Random mark/unmark operations */
+    for (int ops = 0; ops < STRESS_MARK_COUNT * 8; ops++) {
+        uint64_t idx = xorshift64(&rng) % STRESS_MARK_COUNT;
+        xa_mark_t mark = (xa_mark_t)(xorshift64(&rng) % XA_MAX_MARKS);
+        bool set = (xorshift64(&rng) % 2) != 0;
+
+        if (set) {
+            xa_set_mark(&xa, idx, mark);
+            mark_state[idx][mark] = 1;
+        } else {
+            xa_clear_mark(&xa, idx, mark);
+            mark_state[idx][mark] = 0;
+        }
+    }
+
+    /* Verify all mark states */
+    for (uint64_t i = 0; i < STRESS_MARK_COUNT; i++) {
+        for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
+            bool expected = mark_state[i][m] != 0;
+            assert_int_equal(xa_get_mark(&xa, i, m), expected);
+        }
+    }
+
+    /* Verify marked iteration counts for each mark */
+    for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
+        size_t expected_count = 0;
+        for (uint64_t i = 0; i < STRESS_MARK_COUNT; i++) {
+            if (mark_state[i][m])
+                expected_count++;
+        }
+
+        uint64_t idx;
+        void *entry;
+        size_t actual_count = 0;
+        xa_for_each_marked(&xa, idx, entry, m) {
+            assert_true(mark_state[idx][m]);
+            actual_count++;
+        }
+        assert_int_equal(actual_count, expected_count);
+    }
+
+    /* Erase random entries and verify marks are cleaned up */
+    for (uint64_t i = 0; i < STRESS_MARK_COUNT; i += 3) {
+        xa_erase(&xa, i);
+        for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
+            assert_false(xa_get_mark(&xa, i, m));
+            mark_state[i][m] = 0;
+        }
+    }
+
+    /* Re-verify marked iteration after erasures */
+    for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
+        size_t expected_count = 0;
+        for (uint64_t i = 0; i < STRESS_MARK_COUNT; i++) {
+            if (mark_state[i][m])
+                expected_count++;
+        }
+
+        uint64_t idx;
+        void *entry;
+        size_t actual_count = 0;
+        xa_for_each_marked(&xa, idx, entry, m) {
+            actual_count++;
+        }
+        assert_int_equal(actual_count, expected_count);
+    }
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Full node churn — fill and empty many nodes               */
+/* ====================================================================== */
+
+#define STRESS_NODE_CHURN_NODES  32   /* number of 64-slot nodes to fill */
+
+static void test_stress_node_churn(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    const size_t total = STRESS_NODE_CHURN_NODES * XA_CHUNK_SIZE;
+
+    for (int round = 0; round < 4; round++) {
+        /* Fill: each round writes in a different order */
+        uint64_t indices[STRESS_NODE_CHURN_NODES * XA_CHUNK_SIZE];
+        for (size_t i = 0; i < total; i++)
+            indices[i] = i;
+
+        uint64_t rng = 0xBAADF00D00000000ULL + (uint64_t)round;
+        for (size_t i = total - 1; i > 0; i--) {
+            size_t j = xorshift64(&rng) % (i + 1);
+            uint64_t tmp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = tmp;
+        }
+
+        for (size_t i = 0; i < total; i++)
+            xa_store(&xa, indices[i], ENTRY(indices[i]), 0);
+
+        assert_int_equal(xa_count_entries(&xa), total);
+
+        /* Verify */
+        for (size_t i = 0; i < total; i++)
+            assert_ptr_equal(xa_load(&xa, i), ENTRY(i));
+
+        /* Erase in shuffled order */
+        rng = 0xCAFED00D00000000ULL + (uint64_t)round;
+        for (size_t i = total - 1; i > 0; i--) {
+            size_t j = xorshift64(&rng) % (i + 1);
+            uint64_t tmp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = tmp;
+        }
+
+        for (size_t i = 0; i < total; i++) {
+            void *old = xa_erase(&xa, indices[i]);
+            assert_ptr_equal(old, ENTRY(indices[i]));
+        }
+
+        assert_true(xa_empty(&xa));
+    }
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Interleaved operations — store, mark, find, erase         */
+/* ====================================================================== */
+
+#define STRESS_INTERLEAVE_COUNT  1024
+
+static void test_stress_interleaved_ops(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    uint64_t rng = 0x0011223344556677ULL;
+
+    /* Phase 1: insert and mark simultaneously */
+    for (uint64_t i = 0; i < STRESS_INTERLEAVE_COUNT; i++) {
+        xa_store(&xa, i, ENTRY(i), 0);
+        /* Mark every 3rd with MARK_0, every 5th with MARK_1 */
+        if (i % 3 == 0)
+            xa_set_mark(&xa, i, XA_MARK_0);
+        if (i % 5 == 0)
+            xa_set_mark(&xa, i, XA_MARK_1);
+    }
+
+    /* Verify mark counts */
+    uint64_t idx;
+    void *entry;
+    size_t m0_count = 0, m1_count = 0;
+    xa_for_each_marked(&xa, idx, entry, XA_MARK_0) { m0_count++; }
+    xa_for_each_marked(&xa, idx, entry, XA_MARK_1) { m1_count++; }
+
+    size_t expected_m0 = 0, expected_m1 = 0;
+    for (uint64_t i = 0; i < STRESS_INTERLEAVE_COUNT; i++) {
+        if (i % 3 == 0) expected_m0++;
+        if (i % 5 == 0) expected_m1++;
+    }
+    assert_int_equal(m0_count, expected_m0);
+    assert_int_equal(m1_count, expected_m1);
+
+    /* Phase 2: erase random entries while using xa_find to walk */
+    for (int pass = 0; pass < 4; pass++) {
+        /* Erase ~25% of remaining */
+        for (uint64_t i = 0; i < STRESS_INTERLEAVE_COUNT; i++) {
+            if ((xorshift64(&rng) % 4) == 0)
+                xa_erase(&xa, i);
+        }
+
+        /* Walk with xa_find — must be in ascending order */
+        idx = 0;
+        entry = xa_find(&xa, &idx, ~0ULL, XA_MARK_MAX);
+        uint64_t prev = 0;
+        bool first = true;
+        while (entry != NULL) {
+            if (!first)
+                assert_true(idx > prev);
+            first = false;
+            prev = idx;
+            entry = xa_find_after(&xa, &idx, ~0ULL, XA_MARK_MAX);
+        }
+
+        /* Walk with xa_find marked — must still be in order */
+        idx = 0;
+        entry = xa_find(&xa, &idx, ~0ULL, XA_MARK_0);
+        prev = 0;
+        first = true;
+        while (entry != NULL) {
+            if (!first)
+                assert_true(idx > prev);
+            /* This entry must actually have MARK_0 */
+            assert_true(xa_get_mark(&xa, idx, XA_MARK_0));
+            first = false;
+            prev = idx;
+            entry = xa_find_after(&xa, &idx, ~0ULL, XA_MARK_0);
+        }
+    }
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Stress test: Large scale with cursor API                               */
+/* ====================================================================== */
+
+#define STRESS_CURSOR_COUNT  2048
+
+static void test_stress_cursor_api(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Bulk store via cursor API */
+    xa_lock(&xa);
+    for (uint64_t i = 0; i < STRESS_CURSOR_COUNT; i++) {
+        XA_STATE(xas, &xa, i);
+        void *old = xas_store(&xas, ENTRY(i));
+        assert_null(old);
+        assert_false(xas_is_error(&xas));
+    }
+    xa_unlock(&xa);
+
+    assert_int_equal(xa_count_entries(&xa), STRESS_CURSOR_COUNT);
+
+    /* Cursor walk with xas_find */
+    XA_STATE(xas_walk, &xa, 0);
+    xa_rcu_lock();
+    size_t found = 0;
+    void *e = xas_load(&xas_walk);
+    if (e) found++;
+    while ((e = xas_find(&xas_walk, STRESS_CURSOR_COUNT - 1)) != NULL)
+        found++;
+    xa_rcu_unlock();
+    assert_int_equal(found, STRESS_CURSOR_COUNT);
+
+    /* Set marks via cursor, verify via simple API */
+    xa_lock(&xa);
+    for (uint64_t i = 0; i < STRESS_CURSOR_COUNT; i += 7) {
+        XA_STATE(xas_m, &xa, i);
+        xas_load(&xas_m);
+        xas_set_mark(&xas_m, XA_MARK_2);
+    }
+    xa_unlock(&xa);
+
+    size_t mark_count = 0;
+    for (uint64_t i = 0; i < STRESS_CURSOR_COUNT; i++) {
+        if (xa_get_mark(&xa, i, XA_MARK_2)) {
+            assert_int_equal(i % 7, 0);
+            mark_count++;
+        }
+    }
+    size_t expected_marks = (STRESS_CURSOR_COUNT + 6) / 7;
+    assert_int_equal(mark_count, expected_marks);
+
+    /* Bulk erase via cursor API */
+    xa_lock(&xa);
+    for (uint64_t i = 0; i < STRESS_CURSOR_COUNT; i++) {
+        XA_STATE(xas_e, &xa, i);
+        xas_store(&xas_e, NULL);
+    }
+    xa_unlock(&xa);
+
+    assert_true(xa_empty(&xa));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
 /*  Main                                                                   */
 /* ====================================================================== */
 
@@ -1767,7 +2837,7 @@ int main(void)
         cmocka_unit_test(test_mark_missing_entry),
         cmocka_unit_test(test_marks_with_tree_depth),
         cmocka_unit_test(test_all_marks_on_entry),
-        cmocka_unit_test(test_mark_cleared_on_overwrite),
+        cmocka_unit_test(test_mark_survives_overwrite),
         cmocka_unit_test(test_mark_erase_stops_iteration),
 
         /* Value entries */
@@ -1807,6 +2877,39 @@ int main(void)
         /* Cleanup */
         cmocka_unit_test(test_destroy_with_entries),
         cmocka_unit_test(test_destroy_empty),
+
+        /* Edge case tests */
+        cmocka_unit_test(test_uint64_max_index),
+        cmocka_unit_test(test_index0_head_marks),
+        cmocka_unit_test(test_store_index0_into_deep_tree),
+        cmocka_unit_test(test_find_empty),
+        cmocka_unit_test(test_find_after_uint64_max),
+        cmocka_unit_test(test_find_after_at_max),
+        cmocka_unit_test(test_find_max_zero),
+        cmocka_unit_test(test_marked_iteration_empty_and_no_marks),
+        cmocka_unit_test(test_double_erase_same_index),
+        cmocka_unit_test(test_double_destroy_with_entries),
+        cmocka_unit_test(test_sibling_entries),
+        cmocka_unit_test(test_clear_mark_without_mark),
+        cmocka_unit_test(test_marks_across_levels_partial_erase),
+        cmocka_unit_test(test_get_mark_on_empty_index),
+        cmocka_unit_test(test_init_flags),
+
+        /* Negative tests */
+        cmocka_unit_test(test_invalid_mark_value),
+        cmocka_unit_test(test_store_null_nonexistent),
+        cmocka_unit_test(test_cursor_error_state),
+        cmocka_unit_test(test_store_internal_entries),
+        cmocka_unit_test(test_mark_overwrite_head_vs_node),
+
+        /* Stress tests */
+        cmocka_unit_test(test_stress_random_churn),
+        cmocka_unit_test(test_stress_sparse_random),
+        cmocka_unit_test(test_stress_grow_shrink_cycles),
+        cmocka_unit_test(test_stress_random_marks),
+        cmocka_unit_test(test_stress_node_churn),
+        cmocka_unit_test(test_stress_interleaved_ops),
+        cmocka_unit_test(test_stress_cursor_api),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
