@@ -1,7 +1,7 @@
 # XArray — Standalone Radix Tree Library
 
-A portable, Linux-style radix tree (XArray) extracted from xv6 and adapted for
-standalone use with standard C.
+A portable, standalone implementation of the Linux-style radix tree (XArray)
+for use with standard C.
 
 The XArray maps `uint64_t` indices to `void *` entries. Each internal node has
 64 slots (6-bit fan-out). The tree grows and shrinks automatically. Entries can
@@ -46,6 +46,13 @@ Example — build with locking:
 ```sh
 cmake .. -DXA_ENABLE_LOCK=ON
 ```
+
+## Documentation
+
+For a complete reference of every public function, macro, and type, see:
+
+- **[API Reference (English)](API.md)**
+- **[API 参考手册 (中文)](API_zh.md)**
 
 ## API overview
 
@@ -267,4 +274,4 @@ test. All tests run under AddressSanitizer by default.
 
 ## License
 
-Derived from the Linux kernel xarray and xv6. See upstream licenses.
+Derived from the Linux kernel xarray. See upstream licenses.

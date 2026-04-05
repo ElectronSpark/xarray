@@ -2,9 +2,6 @@
  * @file test_xarray.c
  * @brief Comprehensive XArray unit tests using cmocka.
  *
- * Test patterns ported from the xv6 rbtree and list test suites,
- * adapted for the xarray radix-tree data structure.
- *
  * Tests cover:
  *  - Basic store/load/erase (analogous to list push/pop/detach)
  *  - Sequential and random insertion (analogous to rbtree insert tests)
