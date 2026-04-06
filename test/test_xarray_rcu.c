@@ -121,6 +121,21 @@ static void test_rcu_deferred_accounting(void **state)
     xa_rcu_drain();
 }
 
+static void test_rcu_destroy_defers_reclamation(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 4096, ENTRY(4096), 0);
+    xa_store(&xa, 262144, ENTRY(262144), 0);
+
+    xa_destroy(&xa);
+    assert_true(xa_empty(&xa));
+    assert_true(xa_rcu_drain() > 0);
+}
+
 /**
  * Core RCU scenario: lock-free readers + locked writer.
  * Readers call xa_load() WITHOUT the lock.  Writer calls xa_store/xa_erase
@@ -339,6 +354,7 @@ int main(void)
 
         /* -- RCU-specific tests -- */
         T(test_rcu_deferred_accounting),
+        T(test_rcu_destroy_defers_reclamation),
         T(test_rcu_lockfree_readers),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

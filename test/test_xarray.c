@@ -2319,6 +2319,27 @@ static void test_store_internal_entries(void **state)
     xa_destroy(&xa);
 }
 
+static void test_cursor_store_internal_entries(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 3);
+    void *old = xas_store(&xas, XA_ZERO_ENTRY);
+    assert_true(xas_is_error(&xas));
+    assert_int_equal(xas_error(&xas), -EINVAL);
+    assert_null(old);
+    xa_unlock(&xa);
+
+    assert_null(xa_load(&xa, 3));
+    assert_null(xa_store(&xa, 3, ENTRY(3), 0));
+    assert_ptr_equal(xa_load(&xa, 3), ENTRY(3));
+
+    xa_destroy(&xa);
+}
+
 /* ====================================================================== */
 /*  Stress test: Random insert/delete/lookup churn                         */
 /* ====================================================================== */
@@ -3159,6 +3180,57 @@ static void test_find_max_at_intermediate_level(void **state)
     xa_destroy(&xa);
 }
 
+static void test_find_skips_sibling_range(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 4);
+    xas.xa_sibs = 3;
+    assert_null(xas_store(&xas, ENTRY(4)));
+    xa_unlock(&xa);
+
+    xa_store(&xa, 9, ENTRY(9), 0);
+
+    uint64_t idx = 4;
+    void *entry = xa_find(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(4));
+    assert_int_equal(idx, 4);
+
+    entry = xa_find_after(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(9));
+    assert_int_equal(idx, 9);
+
+    idx = 5;
+    entry = xa_find(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(9));
+    assert_int_equal(idx, 9);
+
+    xa_destroy(&xa);
+}
+
+static void test_find_respects_start_above_max(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 100, ENTRY(100), 0);
+    xa_set_mark(&xa, 100, XA_MARK_0);
+
+    uint64_t idx = 100;
+    assert_null(xa_find(&xa, &idx, 50, XA_MARK_MAX));
+    assert_int_equal(idx, 100);
+
+    idx = 100;
+    assert_null(xa_find(&xa, &idx, 50, XA_MARK_0));
+    assert_int_equal(idx, 100);
+
+    xa_destroy(&xa);
+}
+
 /* ====================================================================== */
 /*  Edge case tests — P3: Structural / cleanup                             */
 /* ====================================================================== */
@@ -3504,6 +3576,7 @@ int main(void)
         cmocka_unit_test(test_store_null_nonexistent),
         cmocka_unit_test(test_cursor_error_state),
         cmocka_unit_test(test_store_internal_entries),
+        cmocka_unit_test(test_cursor_store_internal_entries),
         cmocka_unit_test(test_mark_overwrite_head_vs_node),
 
         /* Stress tests */
@@ -3530,6 +3603,8 @@ int main(void)
         cmocka_unit_test(test_find_after_reaches_uint64_max),
         cmocka_unit_test(test_walk_next_rightmost_slots),
         cmocka_unit_test(test_find_max_at_intermediate_level),
+        cmocka_unit_test(test_find_skips_sibling_range),
+        cmocka_unit_test(test_find_respects_start_above_max),
 
         /* P3: Structural / cleanup */
         cmocka_unit_test(test_shrink_nonzero_slot),

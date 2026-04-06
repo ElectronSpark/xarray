@@ -150,9 +150,6 @@ static void xa_clear_marks_at(struct xa_state *xas, struct xa_node *node,
     (void)xas;
 }
 
-#define XA_HEAD_MARK_SHIFT 29
-#define XA_HEAD_MARK_MASK  ((((1U << XA_MAX_MARKS) - 1U) << XA_HEAD_MARK_SHIFT))
-
 static inline unsigned int xa_head_mark_flag(xa_mark_t mark)
 {
     return 1U << (XA_HEAD_MARK_SHIFT + mark);
@@ -729,6 +726,11 @@ void *xas_store(struct xa_state *xas, void *entry)
 {
     void *old;
 
+    if (xa_is_internal(entry)) {
+        xas_set_err(xas, -EINVAL);
+        return NULL;
+    }
+
     old = xas_create(xas);
     if (xas_error(xas))
         return NULL;
@@ -1003,6 +1005,13 @@ static void xa_destroy_node(struct xa_node *node)
     xa_node_free_now(node);
 }
 
+#ifdef XA_CONFIG_RCU
+static void __xa_destroy_node_cb(void *data)
+{
+    xa_destroy_node((struct xa_node *)data);
+}
+#endif
+
 void xa_destroy(struct xarray *xa)
 {
     void *head;
@@ -1014,8 +1023,13 @@ void xa_destroy(struct xarray *xa)
     xa_unlock(xa);
 
     struct xa_node *node = xa_head_to_node(head);
-    if (node != NULL)
+    if (node != NULL) {
+#ifdef XA_CONFIG_RCU
+        xa_call_rcu(__xa_destroy_node_cb, node);
+#else
         xa_destroy_node(node);
+#endif
+    }
 }
 
 /* ====================================================================== */
@@ -1065,6 +1079,10 @@ static void *__xa_find(struct xarray *xa, uint64_t *indexp, uint64_t max,
                        xa_mark_t mark)
 {
     void *entry = NULL;
+
+    if (*indexp > max)
+        return NULL;
+
     XA_STATE(xas, xa, *indexp);
 
     xa_rcu_lock();
@@ -1076,15 +1094,18 @@ static void *__xa_find(struct xarray *xa, uint64_t *indexp, uint64_t max,
         if (entry != NULL && xa_is_entry(entry)) {
             /* After sibling resolution, xa_offset may differ from the
              * offset implied by xa_index.  Report the canonical index. */
+            uint64_t found_index = xas.xa_index;
             struct xa_node *node = xas.xa_node;
             if (node != NULL) {
                 uint64_t base = xa_level_base(xas.xa_index, 0);
-                *indexp = base | xas.xa_offset;
-            } else {
-                *indexp = xas.xa_index;
+                found_index = base | xas.xa_offset;
             }
-            xa_rcu_unlock();
-            return entry;
+
+            if (found_index == xas.xa_index) {
+                *indexp = found_index;
+                xa_rcu_unlock();
+                return entry;
+            }
         }
 
         entry = xas_find(&xas, max);

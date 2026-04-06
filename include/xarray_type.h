@@ -41,6 +41,10 @@
 /** Maximum number of marks supported per entry. */
 #define XA_MAX_MARKS    3
 
+/* xa_flags bit range reserved for single-entry head marks. */
+#define XA_HEAD_MARK_SHIFT 29
+#define XA_HEAD_MARK_MASK  ((((1U << XA_MAX_MARKS) - 1U) << XA_HEAD_MARK_SHIFT))
+
 /* ----------------------------------------------------------------------- */
 /*  Mark types                                                              */
 /* ----------------------------------------------------------------------- */
@@ -164,7 +168,7 @@ struct xa_node {
 /**
  * struct xarray - The XArray root.
  *
- * @xa_flags: Reserved flags (mark state for single-entry head).
+ * @xa_flags: User flags plus reserved bits for single-entry head marks.
  * @xa_head:  Root slot — either NULL (empty), a single user entry
  *            (one-entry optimisation), or an xa_mk_internal(node)
  *            pointing to the top-level xa_node.

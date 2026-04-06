@@ -32,7 +32,7 @@ static inline void xa_init_flags(struct xarray *xa, unsigned int flags)
 #ifdef XA_CONFIG_LOCK
     xa_lock_init(&xa->xa_lock);
 #endif
-    xa->xa_flags = flags;
+    xa->xa_flags = flags & ~XA_HEAD_MARK_MASK;
     xa->xa_head = NULL;
 }
 
@@ -134,7 +134,9 @@ void *xa_erase(struct xarray *xa, uint64_t index);
  * @xa: Xarray.
  *
  * After this call the xarray is empty.  Does NOT free user entries —
- * the caller must have already freed or detached them.
+ * the caller must have already freed or detached them.  When
+ * XA_CONFIG_RCU is enabled, internal nodes are reclaimed after a grace
+ * period.
  */
 void xa_destroy(struct xarray *xa);
 
@@ -241,7 +243,7 @@ void *xas_load(struct xa_state *xas);
 /**
  * xas_store - Store an entry at the cursor's current index.
  * @xas:   XA state (cursor).
- * @entry: Entry to store.
+ * @entry: Entry to store (must not be an internal entry).
  *
  * Returns the old entry.
  */
