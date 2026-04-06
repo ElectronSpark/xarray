@@ -2800,6 +2800,613 @@ static void test_stress_cursor_api(void **state)
 }
 
 /* ====================================================================== */
+/*  Edge case tests — P0: Correctness risks                                */
+/* ====================================================================== */
+
+/**
+ * Head marks must survive when xa_expand promotes head to a node.
+ * Sets mark on index 0 (single-entry head), then stores at a high index
+ * forcing tree growth.  Verifies the mark transfers to the node.
+ */
+static void test_head_marks_survive_expand(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store at index 0 — stored directly in xa_head. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_set_mark(&xa, 0, XA_MARK_0);
+    xa_set_mark(&xa, 0, XA_MARK_2);
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_1));
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    /* Store at index 100 — forces xa_expand (head→leaf→grow). */
+    xa_store(&xa, 100, ENTRY(100), 0);
+
+    /* Marks on index 0 must have survived the expansion. */
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_1));
+    assert_true(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    /* Data intact. */
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+    assert_ptr_equal(xa_load(&xa, 100), ENTRY(100));
+
+    /* Marked iteration should find index 0. */
+    uint64_t idx = 0;
+    void *entry = xa_find(&xa, &idx, UINT64_MAX, XA_MARK_0);
+    assert_ptr_equal(entry, ENTRY(0));
+    assert_int_equal(idx, 0);
+
+    xa_destroy(&xa);
+}
+
+/**
+ * xa_init_flags with bits 29-31 should not corrupt head mark state.
+ * Bits 29-31 of xa_flags are reserved for head marks (XA_HEAD_MARK_SHIFT=29).
+ * Verify that after init with high bits, marks behave correctly.
+ */
+static void test_init_flags_high_bits(void **state)
+{
+    (void)state;
+    struct xarray xa;
+
+    /* Set bits in the mark region (bits 29-31). */
+    xa_init_flags(&xa, (1U << 29) | (1U << 30) | (1U << 31));
+
+    /* Store an entry. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+
+    /* Head marks should reflect the pre-set bits.
+     * This may appear as marks being set initially — the point is
+     * that the implementation doesn't crash and behaves consistently. */
+    bool m0 = xa_get_mark(&xa, 0, XA_MARK_0);
+    bool m1 = xa_get_mark(&xa, 0, XA_MARK_1);
+    bool m2 = xa_get_mark(&xa, 0, XA_MARK_2);
+
+    /* If flags leak into marks, clearing should still work. */
+    if (m0) xa_clear_mark(&xa, 0, XA_MARK_0);
+    if (m1) xa_clear_mark(&xa, 0, XA_MARK_1);
+    if (m2) xa_clear_mark(&xa, 0, XA_MARK_2);
+
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_0));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_1));
+    assert_false(xa_get_mark(&xa, 0, XA_MARK_2));
+
+    /* Data still works fine. */
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Edge case tests — P1: Sibling subsystem                                */
+/* ====================================================================== */
+
+/**
+ * Erase a multi-slot (sibling) entry.  Verifies count accounting
+ * in xas_clear_slot_range when removing siblings.
+ */
+static void test_sibling_erase(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Also store a non-sibling entry so the tree doesn't collapse. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+
+    /* Store a 4-wide sibling at slots 4-7. */
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 4);
+    xas.xa_sibs = 3;
+    xas_store(&xas, ENTRY(4));
+    xa_unlock(&xa);
+
+    assert_ptr_equal(xa_load(&xa, 4), ENTRY(4));
+    assert_ptr_equal(xa_load(&xa, 7), ENTRY(4));
+
+    /* Erase via simple API at the canonical index. */
+    void *old = xa_erase(&xa, 4);
+    assert_ptr_equal(old, ENTRY(4));
+
+    /* All sibling slots should now be empty. */
+    assert_null(xa_load(&xa, 4));
+    assert_null(xa_load(&xa, 5));
+    assert_null(xa_load(&xa, 6));
+    assert_null(xa_load(&xa, 7));
+
+    /* Anchor entry still intact. */
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Overwrite a 4-wide sibling with a 2-wide sibling at the same offset.
+ * Verifies span calculation (old_span > new_span).
+ */
+static void test_sibling_resize_shrink(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0); /* anchor */
+
+    /* Store a 4-wide sibling at slots 4-7. */
+    xa_lock(&xa);
+    XA_STATE(xas1, &xa, 4);
+    xas1.xa_sibs = 3;
+    xas_store(&xas1, ENTRY(40));
+    xa_unlock(&xa);
+
+    /* Overwrite with a 2-wide sibling at slots 4-5. */
+    xa_lock(&xa);
+    XA_STATE(xas2, &xa, 4);
+    xas2.xa_sibs = 1;
+    xas_store(&xas2, ENTRY(42));
+    xa_unlock(&xa);
+
+    assert_ptr_equal(xa_load(&xa, 4), ENTRY(42));
+    assert_ptr_equal(xa_load(&xa, 5), ENTRY(42));
+    /* Slots 6-7 should be cleared. */
+    assert_null(xa_load(&xa, 6));
+    assert_null(xa_load(&xa, 7));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Overwrite a 2-wide sibling with a 4-wide sibling (grow).
+ * Verifies span calculation (new_span > old_span).
+ */
+static void test_sibling_resize_grow(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0); /* anchor */
+
+    /* Store a 2-wide sibling at slots 4-5. */
+    xa_lock(&xa);
+    XA_STATE(xas1, &xa, 4);
+    xas1.xa_sibs = 1;
+    xas_store(&xas1, ENTRY(40));
+    xa_unlock(&xa);
+
+    /* Overwrite with a 4-wide sibling at slots 4-7. */
+    xa_lock(&xa);
+    XA_STATE(xas2, &xa, 4);
+    xas2.xa_sibs = 3;
+    xas_store(&xas2, ENTRY(42));
+    xa_unlock(&xa);
+
+    assert_ptr_equal(xa_load(&xa, 4), ENTRY(42));
+    assert_ptr_equal(xa_load(&xa, 5), ENTRY(42));
+    assert_ptr_equal(xa_load(&xa, 6), ENTRY(42));
+    assert_ptr_equal(xa_load(&xa, 7), ENTRY(42));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Sibling range at the node boundary.
+ * canonical=60, span=4 → slots 60-63, exactly fits.
+ * canonical=61, span=4 → slots 61-64, exceeds XA_CHUNK_SIZE → EINVAL.
+ */
+static void test_sibling_at_chunk_boundary(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0); /* anchor */
+
+    /* Valid: slots 60-63 (fits exactly). */
+    xa_lock(&xa);
+    XA_STATE(xas_ok, &xa, 60);
+    xas_ok.xa_sibs = 3;
+    xas_store(&xas_ok, ENTRY(60));
+    assert_false(xas_is_error(&xas_ok));
+    xa_unlock(&xa);
+
+    assert_ptr_equal(xa_load(&xa, 60), ENTRY(60));
+    assert_ptr_equal(xa_load(&xa, 63), ENTRY(60));
+
+    /* Invalid: slots 62-65 (exceeds chunk).
+     * Use a fresh tree so index 62 is not an existing sibling. */
+    struct xarray xa2;
+    xa_init(&xa2);
+    xa_store(&xa2, 0, ENTRY(0), 0); /* anchor */
+
+    xa_lock(&xa2);
+    XA_STATE(xas_bad, &xa2, 62);
+    xas_bad.xa_sibs = 3;
+    xas_store(&xas_bad, ENTRY(62));
+    assert_true(xas_is_error(&xas_bad));
+    xa_unlock(&xa2);
+
+    xa_destroy(&xa2);
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Set and get marks on sibling entries.
+ * Marks are per-slot, so setting a mark on the canonical slot should be
+ * visible, and iteration should yield the sibling entry exactly once.
+ */
+static void test_sibling_marks(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0); /* anchor */
+
+    /* Store a 4-wide sibling at slots 4-7. */
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 4);
+    xas.xa_sibs = 3;
+    xas_store(&xas, ENTRY(4));
+    xa_unlock(&xa);
+
+    /* Set mark on the canonical index. */
+    xa_set_mark(&xa, 4, XA_MARK_1);
+    assert_true(xa_get_mark(&xa, 4, XA_MARK_1));
+
+    /* Find marked should return the entry at canonical index. */
+    uint64_t idx = 0;
+    void *entry = xa_find(&xa, &idx, UINT64_MAX, XA_MARK_1);
+    assert_non_null(entry);
+    assert_ptr_equal(entry, ENTRY(4));
+    assert_int_equal(idx, 4);
+
+    /* No more marked entries. */
+    entry = xa_find_after(&xa, &idx, UINT64_MAX, XA_MARK_1);
+    assert_null(entry);
+
+    /* Clear the mark. */
+    xa_clear_mark(&xa, 4, XA_MARK_1);
+    assert_false(xa_get_mark(&xa, 4, XA_MARK_1));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Edge case tests — P2: Find/iteration boundary conditions               */
+/* ====================================================================== */
+
+/**
+ * xa_find_after from UINT64_MAX-1 should find an entry at UINT64_MAX.
+ */
+static void test_find_after_reaches_uint64_max(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, UINT64_MAX, ENTRY(99), 0);
+
+    uint64_t idx = UINT64_MAX - 1;
+    void *entry = xa_find_after(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(99));
+    assert_int_equal(idx, UINT64_MAX);
+
+    xa_destroy(&xa);
+}
+
+/**
+ * xas_walk_next must correctly climb from the rightmost slot at every level.
+ * Store entries at slot-63-of-every-level positions and iterate.
+ */
+static void test_walk_next_rightmost_slots(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* slot 63 at level 0 = index 63
+     * slot 63 at level 1 = index 63*64 + 63 = 4095
+     * We store entries at 63 and 4095, then iterate to verify walk_next
+     * can climb from slot 63 of one node to the parent and back down.
+     */
+    xa_store(&xa, 63, ENTRY(63), 0);
+    xa_store(&xa, 4095, ENTRY(4095), 0);
+
+    uint64_t idx = 0;
+    void *entry = xa_find(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(63));
+    assert_int_equal(idx, 63);
+
+    entry = xa_find_after(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(4095));
+    assert_int_equal(idx, 4095);
+
+    entry = xa_find_after(&xa, &idx, UINT64_MAX, XA_MARK_MAX);
+    assert_null(entry);
+
+    xa_destroy(&xa);
+}
+
+/**
+ * xas_find with max smaller than the next entry's index at an intermediate
+ * level.  The walk should stop rather than descend into a subtree beyond max.
+ */
+static void test_find_max_at_intermediate_level(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Two entries in different level-1 subtrees. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 100, ENTRY(100), 0);
+
+    /* Search with max=50 should find index 0 but NOT index 100. */
+    uint64_t idx = 0;
+    void *entry = xa_find(&xa, &idx, 50, XA_MARK_MAX);
+    assert_ptr_equal(entry, ENTRY(0));
+    assert_int_equal(idx, 0);
+
+    entry = xa_find_after(&xa, &idx, 50, XA_MARK_MAX);
+    assert_null(entry);
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Edge case tests — P3: Structural / cleanup                             */
+/* ====================================================================== */
+
+/**
+ * xa_shrink should NOT shrink when root has count==1 but the entry
+ * is not in slot 0.  E.g., only entry at index 64 means root's slot[1]
+ * holds the child.  Tree must stay tall.
+ */
+static void test_shrink_nonzero_slot(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store at index 64 — lands in root's slot 1 (level-1 node). */
+    xa_store(&xa, 64, ENTRY(64), 0);
+    assert_ptr_equal(xa_load(&xa, 64), ENTRY(64));
+
+    /* Erase index 64 and re-store at 64 — verifies tree structure. */
+    xa_erase(&xa, 64);
+    assert_null(xa_load(&xa, 64));
+
+    /* Store at both 0 and 64, then erase 0 — root still has slot[1]. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 64, ENTRY(64), 0);
+    xa_erase(&xa, 0);
+
+    /* Index 64 should still be accessible. */
+    assert_ptr_equal(xa_load(&xa, 64), ENTRY(64));
+    assert_null(xa_load(&xa, 0));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * xa_destroy on a 3+ level tree with entries still present.
+ * Exercises the recursive xa_destroy_node path at depth.
+ */
+static void test_destroy_deep_tree(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Level 0: shift=0, covers 0-63
+     * Level 1: shift=6, covers 0-4095
+     * Level 2: shift=12, covers 0-262143
+     * Storing at 0 and 262143 forces a 3-level tree. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 262143, ENTRY(262143), 0);
+    xa_store(&xa, 4096, ENTRY(4096), 0);
+
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+    assert_ptr_equal(xa_load(&xa, 4096), ENTRY(4096));
+    assert_ptr_equal(xa_load(&xa, 262143), ENTRY(262143));
+
+    /* Destroy without erasing — recursive cleanup. */
+    xa_destroy(&xa);
+
+    /* After destroy, tree should be empty. */
+    assert_true(xa_empty(&xa));
+}
+
+/**
+ * Cascading xas_delete_node: erase the last entry in a sparse deep tree.
+ * Should delete nodes up through ancestors until a node with count>0.
+ */
+static void test_cascading_delete_node(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Build a 3-level tree with entries in two distant subtrees. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 200000, ENTRY(200000), 0);
+
+    /* Erase the far entry — its ancestors should cascade-delete
+     * down to the common root. */
+    xa_erase(&xa, 200000);
+    assert_null(xa_load(&xa, 200000));
+
+    /* The other entry is still fine. */
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    /* Now erase the remaining entry — tree should become empty. */
+    xa_erase(&xa, 0);
+    assert_true(xa_empty(&xa));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Mutation (store/erase) during xa_for_each iteration.
+ * Since xa_for_each re-descends from root on each xa_find_after call,
+ * this should work correctly.
+ */
+static void test_mutation_during_iteration(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    for (uint64_t i = 0; i < 20; i++)
+        xa_store(&xa, i, ENTRY(i), 0);
+
+    /* Erase even entries during iteration. */
+    uint64_t index;
+    void *entry;
+    size_t count = 0;
+    xa_for_each(&xa, index, entry) {
+        count++;
+        if (index % 2 == 0)
+            xa_erase(&xa, index);
+    }
+
+    /* Should have seen all 20 entries (some may be seen before erase). */
+    assert_true(count >= 10);
+
+    /* Only odd entries should remain. */
+    for (uint64_t i = 0; i < 20; i++) {
+        if (i % 2 == 0)
+            assert_null(xa_load(&xa, i));
+        else
+            assert_ptr_equal(xa_load(&xa, i), ENTRY(i));
+    }
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
+/*  Edge case tests — P4: Defensive / minor                                */
+/* ====================================================================== */
+
+/**
+ * Value entries with encodings near sentinel values.
+ * xa_mk_value(0x40) → 0x102, near XA_RETRY_ENTRY (0x101).
+ * Ensures the encoding never collides with sentinels.
+ */
+static void test_value_entry_near_sentinel(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* 0x40 encodes to (0x40 << 2) | 2 = 0x102, near RETRY=0x101. */
+    xa_store(&xa, 0, xa_mk_value(0x40), 0);
+    void *v = xa_load(&xa, 0);
+    assert_true(xa_is_value(v));
+    assert_int_equal(xa_to_value(v), 0x40);
+    assert_true(v != XA_RETRY_ENTRY);
+    assert_true(v != XA_ZERO_ENTRY);
+
+    /* 0x80 encodes to (0x80 << 2) | 2 = 0x202, near ZERO=0x201. */
+    xa_store(&xa, 1, xa_mk_value(0x80), 0);
+    v = xa_load(&xa, 1);
+    assert_true(xa_is_value(v));
+    assert_int_equal(xa_to_value(v), 0x80);
+    assert_true(v != XA_RETRY_ENTRY);
+    assert_true(v != XA_ZERO_ENTRY);
+
+    xa_destroy(&xa);
+}
+
+/**
+ * xas_find_marked directly on a single-entry head.
+ * Verifies cursor state correctness (xa_node=NULL, xa_offset=0).
+ */
+static void test_cursor_find_marked_head(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_set_mark(&xa, 0, XA_MARK_0);
+
+    /* Use cursor API to find marked on single-entry head. */
+    XA_STATE(xas, &xa, 0);
+    xa_rcu_lock();
+    void *entry = xas_find_marked(&xas, UINT64_MAX, XA_MARK_0);
+    assert_ptr_equal(entry, ENTRY(0));
+    assert_int_equal(xas.xa_index, 0);
+
+    /* No more marked entries. */
+    entry = xas_find_marked(&xas, UINT64_MAX, XA_MARK_0);
+    assert_null(entry);
+    xa_rcu_unlock();
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Sibling store on a single-entry head should fail with EINVAL.
+ * xas_store_to_head rejects xa_sibs != 0.
+ */
+static void test_sibling_store_on_head(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    xa_store(&xa, 0, ENTRY(0), 0);
+
+    /* Try to store a 2-wide sibling at index 0 (head entry). */
+    xa_lock(&xa);
+    XA_STATE(xas, &xa, 0);
+    xas.xa_sibs = 1;
+    void *old = xas_store(&xas, ENTRY(99));
+    assert_true(xas_is_error(&xas));
+    assert_null(old);
+    xa_unlock(&xa);
+
+    /* Original entry undamaged. */
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+
+    xa_destroy(&xa);
+}
+
+/**
+ * Multi-level grow in a single xa_store: store at an index requiring
+ * multiple levels to be added in one expansion.
+ */
+static void test_multi_level_expand(void **state)
+{
+    (void)state;
+    struct xarray xa;
+    xa_init(&xa);
+
+    /* Store at index 0 (head entry), then at 2^18 = 262144 which requires
+     * growing from 1 level to 4 levels in one xa_expand call. */
+    xa_store(&xa, 0, ENTRY(0), 0);
+    xa_store(&xa, 262144, ENTRY(262144), 0);
+
+    assert_ptr_equal(xa_load(&xa, 0), ENTRY(0));
+    assert_ptr_equal(xa_load(&xa, 262144), ENTRY(262144));
+
+    /* Verify intermediate indices are empty. */
+    assert_null(xa_load(&xa, 1));
+    assert_null(xa_load(&xa, 63));
+    assert_null(xa_load(&xa, 64));
+    assert_null(xa_load(&xa, 4096));
+
+    xa_destroy(&xa);
+}
+
+/* ====================================================================== */
 /*  Main                                                                   */
 /* ====================================================================== */
 
@@ -2907,6 +3514,34 @@ int main(void)
         cmocka_unit_test(test_stress_node_churn),
         cmocka_unit_test(test_stress_interleaved_ops),
         cmocka_unit_test(test_stress_cursor_api),
+
+        /* P0: Correctness edge cases */
+        cmocka_unit_test(test_head_marks_survive_expand),
+        cmocka_unit_test(test_init_flags_high_bits),
+
+        /* P1: Sibling subsystem */
+        cmocka_unit_test(test_sibling_erase),
+        cmocka_unit_test(test_sibling_resize_shrink),
+        cmocka_unit_test(test_sibling_resize_grow),
+        cmocka_unit_test(test_sibling_at_chunk_boundary),
+        cmocka_unit_test(test_sibling_marks),
+
+        /* P2: Find/iteration boundaries */
+        cmocka_unit_test(test_find_after_reaches_uint64_max),
+        cmocka_unit_test(test_walk_next_rightmost_slots),
+        cmocka_unit_test(test_find_max_at_intermediate_level),
+
+        /* P3: Structural / cleanup */
+        cmocka_unit_test(test_shrink_nonzero_slot),
+        cmocka_unit_test(test_destroy_deep_tree),
+        cmocka_unit_test(test_cascading_delete_node),
+        cmocka_unit_test(test_mutation_during_iteration),
+
+        /* P4: Defensive / minor */
+        cmocka_unit_test(test_value_entry_near_sentinel),
+        cmocka_unit_test(test_cursor_find_marked_head),
+        cmocka_unit_test(test_sibling_store_on_head),
+        cmocka_unit_test(test_multi_level_expand),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

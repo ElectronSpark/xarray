@@ -59,6 +59,35 @@ if(XA_BUILD_TESTS)
         target_compile_definitions(test_xarray PRIVATE ${XA_COMPILE_DEFS})
 
         add_test(NAME xarray_tests COMMAND test_xarray)
+
+        # ── RCU test ──────────────────────────────────────────────────────
+        # A second library build with XA_CONFIG_RCU + XA_CUSTOM_RCU enabled,
+        # linked against the RCU test file that supplies a primitive RCU
+        # implementation (deferred-free with a global linked list).
+        add_library(xarray_rcu src/xarray.c)
+        target_include_directories(xarray_rcu PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        )
+        target_compile_definitions(xarray_rcu PUBLIC
+            XA_CONFIG_RCU XA_CUSTOM_RCU XA_CONFIG_LOCK)
+        target_compile_options(xarray_rcu PRIVATE -Wall -Wextra -Wpedantic)
+        find_package(Threads REQUIRED)
+        target_link_libraries(xarray_rcu PUBLIC Threads::Threads)
+        if(ENABLE_ASAN)
+            target_compile_options(xarray_rcu PRIVATE
+                -fsanitize=address -fno-omit-frame-pointer)
+            target_link_options(xarray_rcu PRIVATE -fsanitize=address)
+        endif()
+
+        add_executable(test_xarray_rcu test/test_xarray_rcu.c)
+        target_link_libraries(test_xarray_rcu PRIVATE xarray_rcu ${CMOCKA_LIB} pthread)
+        target_include_directories(test_xarray_rcu PRIVATE ${CMOCKA_INCLUDE})
+        target_compile_options(test_xarray_rcu PRIVATE
+            -Wall -Wextra ${ASAN_COMPILE_FLAGS}
+        )
+        target_link_options(test_xarray_rcu PRIVATE ${ASAN_LINK_FLAGS})
+
+        add_test(NAME xarray_rcu_tests COMMAND test_xarray_rcu)
     else()
         message(WARNING "cmocka not found — tests will not be built. "
                         "Install libcmocka-dev or set CMOCKA_LIB/CMOCKA_INCLUDE.")

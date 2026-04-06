@@ -238,6 +238,18 @@ extern void xa_call_rcu(xa_rcu_callback_t cb, void *data);
 #endif /* XA_CUSTOM_BARRIERS */
 
 /* ====================================================================== */
+/*  Compiler helpers                                                       */
+/* ====================================================================== */
+
+/*
+ * READ_ONCE / WRITE_ONCE — prevent the compiler from optimising away or
+ * reordering individual accesses.  Used for RCU-safe reads of fields that
+ * may be concurrently written (e.g. node->count, xa_head).
+ */
+#define READ_ONCE(x)       (*(const volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, val) do { *(volatile __typeof__(x) *)&(x) = (val); } while (0)
+
+/* ====================================================================== */
 /*  Slot / flag access with memory ordering                                */
 /* ====================================================================== */
 

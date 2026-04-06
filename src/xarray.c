@@ -97,6 +97,8 @@ static inline bool node_get_mark(const struct xa_node *node, uint8_t offset,
 static inline void node_clear_mark(struct xa_node *node, uint8_t offset,
                                    xa_mark_t mark);
 static inline bool node_any_mark(const struct xa_node *node, xa_mark_t mark);
+static void node_propagate_mark_clear(struct xa_node *node, uint8_t offset,
+                                      xa_mark_t mark);
 
 static void *xa_resolve_sibling(struct xa_node *node, uint8_t *offset)
 {
@@ -142,21 +144,9 @@ static void xa_clear_marks_at(struct xa_state *xas, struct xa_node *node,
                               uint8_t offset)
 {
     for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
-        if (!node_get_mark(node, offset, m))
-            continue;
-
-        node_clear_mark(node, offset, m);
-
-        struct xa_node *cur = node;
-        while (cur->parent) {
-            uint8_t off = cur->offset;
-            if (node_any_mark(cur, m))
-                break;
-            cur = cur->parent;
-            node_clear_mark(cur, off, m);
-        }
+        if (node_get_mark(node, offset, m))
+            node_propagate_mark_clear(node, offset, m);
     }
-
     (void)xas;
 }
 
@@ -234,6 +224,44 @@ static inline bool node_any_mark(const struct xa_node *node, xa_mark_t mark)
             return true;
     }
     return false;
+}
+
+/**
+ * node_propagate_mark_set - Set a mark and propagate it up to ancestors.
+ *
+ * Sets @mark at @offset in @node, then walks up the parent chain setting
+ * the mark on each ancestor until an ancestor already has the mark set.
+ */
+static void node_propagate_mark_set(struct xa_node *node, uint8_t offset,
+                                    xa_mark_t mark)
+{
+    node_set_mark(node, offset, mark);
+    while (node->parent) {
+        uint8_t off = node->offset;
+        node = node->parent;
+        if (node_get_mark(node, off, mark))
+            break;
+        node_set_mark(node, off, mark);
+    }
+}
+
+/**
+ * node_propagate_mark_clear - Clear a mark and propagate up to ancestors.
+ *
+ * Clears @mark at @offset in @node, then walks up the parent chain
+ * clearing the mark from each ancestor whose children no longer carry it.
+ */
+static void node_propagate_mark_clear(struct xa_node *node, uint8_t offset,
+                                      xa_mark_t mark)
+{
+    node_clear_mark(node, offset, mark);
+    while (node->parent) {
+        uint8_t off = node->offset;
+        if (node_any_mark(node, mark))
+            break;
+        node = node->parent;
+        node_clear_mark(node, off, mark);
+    }
 }
 
 /* ====================================================================== */
@@ -527,19 +555,8 @@ static void xas_delete_node(struct xa_state *xas)
             xa_slot_store(&parent->slots[node->offset], NULL);
 
             for (xa_mark_t m = 0; m < XA_MAX_MARKS; m++) {
-                if (!node_get_mark(parent, node->offset, m))
-                    continue;
-
-                node_clear_mark(parent, node->offset, m);
-
-                struct xa_node *cur = parent;
-                while (cur->parent) {
-                    uint8_t off = cur->offset;
-                    if (node_any_mark(cur, m))
-                        break;
-                    cur = cur->parent;
-                    node_clear_mark(cur, off, m);
-                }
+                if (node_get_mark(parent, node->offset, m))
+                    node_propagate_mark_clear(parent, node->offset, m);
             }
 
             parent->count--;
@@ -559,9 +576,153 @@ static void xas_delete_node(struct xa_state *xas)
 /*  XAS (cursor) API implementation                                        */
 /* ====================================================================== */
 
+/**
+ * xas_walk_next - Advance the cursor to the next qualifying slot.
+ *
+ * Starting from xas->xa_offset + 1 in @node, scan forward for:
+ *   - Any non-NULL non-sibling entry (when @mark >= XA_MAX_MARKS)
+ *   - A slot with the given @mark set (when @mark < XA_MAX_MARKS)
+ *
+ * If no qualifying slot is found in @node, walk up to the parent
+ * and repeat.  Updates xas->xa_index to the new position on success.
+ *
+ * Returns true if a qualifying slot was found, false if exhausted.
+ */
+static bool xas_walk_next(struct xa_state *xas, struct xa_node *node,
+                          xa_mark_t mark)
+{
+    while (node) {
+        for (uint8_t off = xas->xa_offset + 1; off < XA_CHUNK_SIZE; off++) {
+            bool match;
+            if (mark < XA_MAX_MARKS)
+                match = node_get_mark(node, off, mark);
+            else {
+                void *slot = xa_slot_load(&node->slots[off]);
+                match = (slot != NULL && !xa_is_sibling(slot));
+            }
+            if (match) {
+                uint64_t base = xa_level_base(xas->xa_index, node->shift);
+                xas->xa_index = base | ((uint64_t)off << node->shift);
+                return true;
+            }
+        }
+        xas->xa_offset = node->offset;
+        node = node->parent;
+    }
+    return false;
+}
+
+/**
+ * xas_invalid - Check if cursor is in an error or unpositioned state.
+ *
+ * Returns true for BOUNDS, ERROR, RESTART — but NOT for NULL (which is
+ * a valid positioned state meaning "at the head entry").  Use this as
+ * the guard in mark operations where the NULL/head case must proceed.
+ */
+static inline bool xas_invalid(const struct xa_state *xas)
+{
+    return xas->xa_node == XAS_BOUNDS ||
+           xas->xa_node == XAS_ERROR ||
+           xas->xa_node == XAS_RESTART;
+}
+
 void *xas_load(struct xa_state *xas)
 {
     return xas_descend_to_leaf(xas);
+}
+
+/**
+ * xas_store_to_head - Handle the head-entry (single slot, no node) case.
+ *
+ * When the tree has only index 0 stored directly in xa_head, this
+ * function replaces or erases it.  Returns the previous head entry.
+ */
+static void *xas_store_to_head(struct xa_state *xas, void *entry)
+{
+    if (xas->xa_sibs != 0) {
+        xas_set_err(xas, -EINVAL);
+        return NULL;
+    }
+    void *prev = xa_slot_load(&xas->xa->xa_head);
+    xa_slot_store(&xas->xa->xa_head, entry);
+
+    if (entry == NULL || prev == NULL)
+        xa_head_clear_all_marks(xas->xa);
+
+    return prev;
+}
+
+/**
+ * xas_validate_sibling_range - Check that the target slot range is valid.
+ *
+ * Ensures the range [canonical, canonical + new_span) fits within the
+ * node and does not overlap with foreign (non-sibling) entries.
+ * Returns true if valid, false and sets -EINVAL if not.
+ */
+static bool xas_validate_sibling_range(struct xa_state *xas,
+                                       struct xa_node *node,
+                                       uint8_t canonical, uint8_t new_span)
+{
+    if ((uint16_t)canonical + new_span > XA_CHUNK_SIZE) {
+        xas_set_err(xas, -EINVAL);
+        return false;
+    }
+    for (uint8_t i = 1; i < new_span; i++) {
+        void *slot = xa_slot_load(&node->slots[canonical + i]);
+        if (slot == NULL)
+            continue;
+        if (!xa_is_sibling(slot) || xa_to_sibling(slot) != canonical) {
+            xas_set_err(xas, -EINVAL);
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * xas_clear_slot_range - Clear old slots and their marks.
+ *
+ * Clears up to @count slots starting at @canonical.  Marks on the
+ * canonical slot are preserved when @preserve_canonical_marks is true
+ * (i.e. overwrite rather than erase).
+ */
+static void xas_clear_slot_range(struct xa_state *xas, struct xa_node *node,
+                                 uint8_t canonical, uint8_t count,
+                                 bool preserve_canonical_marks)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t off = canonical + i;
+        if (off >= XA_CHUNK_SIZE)
+            break;
+        void *slot = xa_slot_load(&node->slots[off]);
+        if (slot == NULL)
+            continue;
+        if (off != canonical &&
+            (!xa_is_sibling(slot) || xa_to_sibling(slot) != canonical))
+            break;
+        if (!preserve_canonical_marks || off != canonical)
+            xa_clear_marks_at(xas, node, off);
+        xa_slot_store(&node->slots[off], NULL);
+        node->count--;
+    }
+}
+
+/**
+ * xas_fill_slot_range - Write an entry and its sibling pointers.
+ *
+ * Stores @entry at @canonical and fills slots [canonical+1, canonical+count)
+ * with sibling pointers back to @canonical.
+ */
+static void xas_fill_slot_range(struct xa_node *node, uint8_t canonical,
+                                void *entry, uint8_t count)
+{
+    xa_slot_store(&node->slots[canonical], entry);
+    node->count++;
+    for (uint8_t i = 1; i < count; i++) {
+        xa_slot_store(&node->slots[canonical + i],
+                      xa_mk_sibling(canonical));
+        node->count++;
+    }
 }
 
 void *xas_store(struct xa_state *xas, void *entry)
@@ -574,72 +735,27 @@ void *xas_store(struct xa_state *xas, void *entry)
 
     struct xa_node *node = xas->xa_node;
 
-    if (node == NULL) {
-        if (xas->xa_sibs != 0) {
-            xas_set_err(xas, -EINVAL);
-            return NULL;
-        }
-        void *prev = xa_slot_load(&xas->xa->xa_head);
-        xa_slot_store(&xas->xa->xa_head, entry);
+    /* Single-entry head: no node in the tree yet. */
+    if (node == NULL)
+        return xas_store_to_head(xas, entry);
 
-        if (entry == NULL || prev == NULL)
-            xa_head_clear_all_marks(xas->xa);
-
-        return prev;
-    }
-
+    /* Resolve the canonical (non-sibling) slot and compute spans. */
     uint8_t canonical = xas->xa_offset;
     old = xa_resolve_sibling(node, &canonical);
     uint8_t old_span = (old != NULL) ? xa_sibling_span(node, canonical) : 1;
     uint8_t new_span = xas->xa_sibs + 1;
 
-    if ((uint16_t)canonical + new_span > XA_CHUNK_SIZE) {
-        xas_set_err(xas, -EINVAL);
+    if (!xas_validate_sibling_range(xas, node, canonical, new_span))
         return NULL;
-    }
 
-    for (uint8_t i = 0; i < new_span; i++) {
-        uint8_t off = canonical + i;
-        void *slot = xa_slot_load(&node->slots[off]);
-        if (slot == NULL)
-            continue;
-        if (i == 0)
-            continue;
-        if (!xa_is_sibling(slot) || xa_to_sibling(slot) != canonical) {
-            xas_set_err(xas, -EINVAL);
-            return NULL;
-        }
-    }
-
+    /* Clear old slots; preserve canonical marks on overwrite. */
     uint8_t clear_span = old_span > new_span ? old_span : new_span;
-    for (uint8_t i = 0; i < clear_span; i++) {
-        uint8_t off = canonical + i;
-        if (off >= XA_CHUNK_SIZE)
-            break;
-        void *slot = xa_slot_load(&node->slots[off]);
-        if (slot == NULL)
-            continue;
-        if (off != canonical &&
-            (!xa_is_sibling(slot) || xa_to_sibling(slot) != canonical))
-            break;
-        /* Preserve marks on the canonical slot during overwrite;
-         * only clear marks when erasing (entry == NULL) or on
-         * sibling slots being removed. */
-        if (off != canonical || entry == NULL)
-            xa_clear_marks_at(xas, node, off);
-        xa_slot_store(&node->slots[off], NULL);
-        node->count--;
-    }
+    xas_clear_slot_range(xas, node, canonical, clear_span,
+                         entry != NULL);
 
-    if (entry != NULL) {
-        xa_slot_store(&node->slots[canonical], entry);
-        node->count++;
-        for (uint8_t i = 1; i < new_span; i++) {
-            xa_slot_store(&node->slots[canonical + i],
-                          xa_mk_sibling(canonical));
-            node->count++;
-        }
-    }
+    /* Write the new entry (and sibling pointers if multi-slot). */
+    if (entry != NULL)
+        xas_fill_slot_range(node, canonical, entry, new_span);
 
     xas->xa_offset = canonical;
     xas->xa_sibs = (entry != NULL) ? (new_span - 1) : 0;
@@ -690,35 +806,10 @@ void *xas_find(struct xa_state *xas, uint64_t max)
                 return entry;
         }
 
-        struct xa_node *node = xas->xa_node;
-        if (xas_is_special(xas)) {
+        if (xas_is_special(xas))
             return NULL;
-        }
 
-        bool found = false;
-        while (node) {
-            uint8_t offset = xas->xa_offset + 1;
-            while (offset < XA_CHUNK_SIZE) {
-                void *slot_entry = xa_slot_load(&node->slots[offset]);
-                if (slot_entry != NULL && !xa_is_sibling(slot_entry)) {
-                    uint64_t base = xa_level_base(xas->xa_index, node->shift);
-                    xas->xa_index = base | ((uint64_t)offset << node->shift);
-                    found = true;
-                    break;
-                }
-                offset++;
-            }
-            if (found)
-                break;
-
-            xas->xa_offset = node->offset;
-            node = node->parent;
-            if (node == NULL) {
-                return NULL;
-            }
-        }
-
-        if (!found)
+        if (!xas_walk_next(xas, xas->xa_node, XA_MARK_MAX))
             return NULL;
     }
 
@@ -757,43 +848,21 @@ void *xas_find_marked(struct xa_state *xas, uint64_t max, xa_mark_t mark)
     while (xas->xa_index <= max) {
         xas->xa_node = XAS_RESTART;
         void *entry = xas_descend_to_leaf(xas);
+
+        if (xas_is_special(xas))
+            return NULL;
+
         struct xa_node *node = xas->xa_node;
-
-        if (node == XAS_BOUNDS || node == XAS_ERROR || node == XAS_RESTART)
+        if (node == NULL)
             return NULL;
 
-        if (node != NULL) {
-            uint64_t base = xa_level_base(xas->xa_index, 0);
-            uint64_t canonical = base | xas->xa_offset;
-            if (entry != NULL && canonical == xas->xa_index &&
-                node_get_mark(node, xas->xa_offset, mark))
-                return entry;
-        } else {
-            return NULL;
-        }
+        uint64_t base = xa_level_base(xas->xa_index, 0);
+        uint64_t canonical = base | xas->xa_offset;
+        if (entry != NULL && canonical == xas->xa_index &&
+            node_get_mark(node, xas->xa_offset, mark))
+            return entry;
 
-        bool found = false;
-        while (node) {
-            uint8_t offset = xas->xa_offset + 1;
-            while (offset < XA_CHUNK_SIZE) {
-                if (node_get_mark(node, offset, mark)) {
-                    uint64_t base = xa_level_base(xas->xa_index, node->shift);
-                    xas->xa_index = base | ((uint64_t)offset << node->shift);
-                    found = true;
-                    break;
-                }
-                offset++;
-            }
-            if (found)
-                break;
-
-            xas->xa_offset = node->offset;
-            node = node->parent;
-            if (node == NULL)
-                return NULL;
-        }
-
-        if (!found)
+        if (!xas_walk_next(xas, node, mark))
             return NULL;
     }
 
@@ -802,12 +871,10 @@ void *xas_find_marked(struct xa_state *xas, uint64_t max, xa_mark_t mark)
 
 void xas_set_mark(struct xa_state *xas, xa_mark_t mark)
 {
-    struct xa_node *node = xas->xa_node;
+    if (mark >= XA_MAX_MARKS || xas_invalid(xas))
+        return;
 
-    if (mark >= XA_MAX_MARKS)
-        return;
-    if (node == XAS_BOUNDS || node == XAS_ERROR || node == XAS_RESTART)
-        return;
+    struct xa_node *node = xas->xa_node;
 
     if (node == NULL) {
         if (xas->xa_index != 0)
@@ -818,25 +885,15 @@ void xas_set_mark(struct xa_state *xas, xa_mark_t mark)
         return;
     }
 
-    node_set_mark(node, xas->xa_offset, mark);
-
-    while (node->parent) {
-        uint8_t off = node->offset;
-        node = node->parent;
-        if (node_get_mark(node, off, mark))
-            break;
-        node_set_mark(node, off, mark);
-    }
+    node_propagate_mark_set(node, xas->xa_offset, mark);
 }
 
 void xas_clear_mark(struct xa_state *xas, xa_mark_t mark)
 {
-    struct xa_node *node = xas->xa_node;
+    if (mark >= XA_MAX_MARKS || xas_invalid(xas))
+        return;
 
-    if (mark >= XA_MAX_MARKS)
-        return;
-    if (node == XAS_BOUNDS || node == XAS_ERROR || node == XAS_RESTART)
-        return;
+    struct xa_node *node = xas->xa_node;
 
     if (node == NULL) {
         if (xas->xa_index == 0)
@@ -844,30 +901,19 @@ void xas_clear_mark(struct xa_state *xas, xa_mark_t mark)
         return;
     }
 
-    node_clear_mark(node, xas->xa_offset, mark);
-
-    while (node->parent) {
-        uint8_t off = node->offset;
-        if (node_any_mark(node, mark))
-            break;
-        node = node->parent;
-        node_clear_mark(node, off, mark);
-    }
+    node_propagate_mark_clear(node, xas->xa_offset, mark);
 }
 
 bool xas_get_mark(struct xa_state *xas, xa_mark_t mark)
 {
-    struct xa_node *node = xas->xa_node;
+    if (mark >= XA_MAX_MARKS || xas_invalid(xas))
+        return false;
 
-    if (mark >= XA_MAX_MARKS)
-        return false;
-    if (node == XAS_BOUNDS || node == XAS_ERROR || node == XAS_RESTART)
-        return false;
+    struct xa_node *node = xas->xa_node;
 
     if (node == NULL) {
         if (xas->xa_index != 0)
             return false;
-
         void *head = xa_slot_load(&xas->xa->xa_head);
         if (!xa_is_entry(head))
             return false;
@@ -1028,7 +1074,15 @@ static void *__xa_find(struct xarray *xa, uint64_t *indexp, uint64_t max,
         entry = xas_descend_to_leaf(&xas);
 
         if (entry != NULL && xa_is_entry(entry)) {
-            *indexp = xas.xa_index;
+            /* After sibling resolution, xa_offset may differ from the
+             * offset implied by xa_index.  Report the canonical index. */
+            struct xa_node *node = xas.xa_node;
+            if (node != NULL) {
+                uint64_t base = xa_level_base(xas.xa_index, 0);
+                *indexp = base | xas.xa_offset;
+            } else {
+                *indexp = xas.xa_index;
+            }
             xa_rcu_unlock();
             return entry;
         }
@@ -1043,11 +1097,21 @@ static void *__xa_find(struct xarray *xa, uint64_t *indexp, uint64_t max,
         if (e != NULL && xas.xa_node != XAS_BOUNDS && xas.xa_node != XAS_ERROR &&
             xas.xa_node != XAS_RESTART) {
             struct xa_node *node = xas.xa_node;
-            if ((node != NULL && node_get_mark(node, xas.xa_offset, mark)) ||
-                (node == NULL && xas.xa_index == 0 && xa_head_get_mark(xa, mark))) {
-                *indexp = xas.xa_index;
-                xa_rcu_unlock();
-                return e;
+            /* For marked find, only match if the canonical index equals
+             * the requested index.  Sibling slots share the canonical
+             * entry but should not produce duplicate results. */
+            uint64_t canonical_index = xas.xa_index;
+            if (node != NULL) {
+                uint64_t base = xa_level_base(xas.xa_index, 0);
+                canonical_index = base | xas.xa_offset;
+            }
+            if (canonical_index == xas.xa_index) {
+                if ((node != NULL && node_get_mark(node, xas.xa_offset, mark)) ||
+                    (node == NULL && xas.xa_index == 0 && xa_head_get_mark(xa, mark))) {
+                    *indexp = xas.xa_index;
+                    xa_rcu_unlock();
+                    return e;
+                }
             }
         }
 
